@@ -1,12 +1,10 @@
+use crate::game::Game;
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::IpAddr;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use wait_timeout::ChildExt;
-
-pub const PACKAGE: &str = "com.ea.game.pvz2_rfl";
-pub const SAVE_DIR: &str = "/sdcard/Android/data/com.ea.game.pvz2_rfl/files/No_Backup";
 
 #[derive(Clone, Debug)]
 pub struct CmdOutput {
@@ -347,13 +345,14 @@ pub fn stat_remote(serial: &str, path: &str) -> Result<Option<RemoteStat>, Strin
     Ok(Some(RemoteStat { mtime, size }))
 }
 
-pub fn device_is_running(serial: &str) -> Result<bool, String> {
-    let stdout = shell(serial, &format!("pidof {PACKAGE} || true"))?;
+pub fn device_is_running(serial: &str, game: &Game) -> Result<bool, String> {
+    // `Game` only holds validated package names, so no quoting is needed.
+    let stdout = shell(serial, &format!("pidof {} || true", game.package()))?;
     Ok(!stdout.trim().is_empty())
 }
 
-pub fn force_stop(serial: &str) -> Result<(), String> {
-    shell(serial, &format!("am force-stop {PACKAGE}"))
+pub fn force_stop(serial: &str, game: &Game) -> Result<(), String> {
+    shell(serial, &format!("am force-stop {}", game.package()))
         .map(|_| ())
         .map_err(|error| format!("could not stop the game: {error}"))
 }

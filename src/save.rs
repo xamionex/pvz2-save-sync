@@ -1,4 +1,5 @@
 use crate::adb;
+use crate::game::Game;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,15 +53,15 @@ pub struct CopyReport {
 ///
 /// Toybox emits a `.` entry even with `-mindepth 1`, so the parser skips it again.
 /// CDN caches and resumable downloads are device specific and must not be copied.
-fn list_command() -> String {
+fn list_command(game: &Game) -> String {
     format!(
         "if [ -d {dir} ]; then cd {dir} && find . -mindepth 1 -maxdepth 1 ! -name '.' \\( -name 'CDN.*' -o -name 'resumableDownload' \\) -prune -o -exec stat -c '%F|%s|%Y|%n' {{}} +; fi",
-        dir = shell_quote(adb::SAVE_DIR)
+        dir = shell_quote(&game.save_dir())
     )
 }
 
-pub fn list_entries(serial: &str) -> Result<Vec<SaveEntry>, String> {
-    let stdout = adb::shell(serial, &list_command())?;
+pub fn list_entries(serial: &str, game: &Game) -> Result<Vec<SaveEntry>, String> {
+    let stdout = adb::shell(serial, &list_command(game))?;
     Ok(parse_entries(&stdout))
 }
 
@@ -110,9 +111,9 @@ pub fn parse_entries(output: &str) -> Vec<SaveEntry> {
     entries
 }
 
-pub fn probe(serial: &str) -> Result<SaveProbe, String> {
-    let running = adb::device_is_running(serial)?;
-    let entries = list_entries(serial)?;
+pub fn probe(serial: &str, game: &Game) -> Result<SaveProbe, String> {
+    let running = adb::device_is_running(serial, game)?;
+    let entries = list_entries(serial, game)?;
     let core = entries
         .iter()
         .find(|entry| entry.name == CORE_FILE)
@@ -143,7 +144,11 @@ pub fn plan(left: &SaveProbe, right: &SaveProbe) -> SyncPlan {
     }
 }
 
-/// Copy the complete save entry set from one device to the other.
+/// Copy the complete save entry set of `source_game` on `source` over the save
+/// of `target_game` on `target`.
+///
+/// Both games are normally the same. They may differ, for example to move a
+/// save from the base game into a mod; the entries are copied unchanged.
 ///
 /// The target's current save is backed up under the local data directory first.
 /// Every entry is pulled with `-a` so modification times survive.
@@ -156,33 +161,42 @@ pub fn plan(left: &SaveProbe, right: &SaveProbe) -> SyncPlan {
 pub fn copy_save(
     source: &str,
     target: &str,
+    source_game: &Game,
+    target_game: &Game,
     progress: &mut dyn FnMut(&str),
 ) -> Result<CopyReport, String> {
-    let entries = list_entries(source)?;
+    let source_dir = source_game.save_dir();
+    let target_dir = target_game.save_dir();
+    let entries = list_entries(source, source_game)?;
     let core = entries
         .iter()
         .find(|entry| entry.name == CORE_FILE)
         .cloned()
-        .ok_or_else(|| format!("{source} has no Reflourished save ({CORE_FILE} is missing)"))?;
+        .ok_or_else(|| {
+            format!(
+                "{source} has no {} save ({CORE_FILE} is missing)",
+                source_game.label()
+            )
+        })?;
 
     let temp = TempDir::new()?;
 
     progress(&format!("Reading the save from {source}..."));
     for entry in &entries {
-        pull_entry(source, &entry.name, temp.path())?;
+        pull_entry(source, &source_dir, &entry.name, temp.path())?;
     }
 
-    let target_entries = list_entries(target)?;
+    let target_entries = list_entries(target, target_game)?;
     let backup = if target_entries.is_empty() {
         None
     } else {
-        let backup_dir = new_backup_dir(target)?;
+        let backup_dir = new_backup_dir(target, target_game)?;
         progress(&format!(
             "Backing up the target save to {}...",
             backup_dir.display()
         ));
         for entry in &target_entries {
-            pull_entry(target, &entry.name, &backup_dir)
+            pull_entry(target, &target_dir, &entry.name, &backup_dir)
                 .map_err(|error| format!("could not back up the target save: {error}"))?;
         }
         Some(backup_dir)
@@ -190,7 +204,8 @@ pub fn copy_save(
 
     // The game can be launched while the save is being read. Writing over a
     // live save risks corruption, so re-check right before changing the target.
-    if adb::device_is_running(source)? || adb::device_is_running(target)? {
+    if adb::device_is_running(source, source_game)? || adb::device_is_running(target, target_game)?
+    {
         return Err(format!(
             "the game was started during the transfer, so the target save was not changed{}",
             backup_note(&backup)
@@ -202,7 +217,7 @@ pub fn copy_save(
         let mut command = String::from("rm -rf");
         for entry in &target_entries {
             command.push(' ');
-            command.push_str(&shell_quote(&format!("{}/{}", adb::SAVE_DIR, entry.name)));
+            command.push_str(&shell_quote(&format!("{target_dir}/{}", entry.name)));
         }
         adb::shell(target, &command).map_err(|error| {
             format!(
@@ -212,10 +227,9 @@ pub fn copy_save(
         })?;
     }
 
-    adb::mkdir_p(target, adb::SAVE_DIR).map_err(|error| {
+    adb::mkdir_p(target, &target_dir).map_err(|error| {
         format!(
-            "could not create {} on {target}: {error}{}",
-            adb::SAVE_DIR,
+            "could not create {target_dir} on {target}: {error}{}",
             backup_note(&backup)
         )
     })?;
@@ -240,7 +254,7 @@ pub fn copy_save(
         let mut command = String::from("mkdir -p");
         for dir in &dirs {
             command.push(' ');
-            command.push_str(&shell_quote(&format!("{}/{}", adb::SAVE_DIR, dir)));
+            command.push_str(&shell_quote(&format!("{target_dir}/{dir}")));
         }
         adb::shell(target, &command).map_err(|error| {
             format!(
@@ -253,7 +267,7 @@ pub fn copy_save(
     for file in &files {
         progress(&format!("Copying {file} to {target}..."));
         let local = temp.path().join(file);
-        adb::push(target, &local, &remote_parent(file)).map_err(|error| {
+        adb::push(target, &local, &remote_parent(&target_dir, file)).map_err(|error| {
             format!(
                 "could not copy {file} to {target}: {error}{}",
                 backup_note(&backup)
@@ -266,7 +280,7 @@ pub fn copy_save(
     let mut ordered: Vec<&SaveEntry> = entries.iter().collect();
     ordered.sort_by_key(|entry| entry.is_dir);
     for entry in ordered {
-        let path = format!("{}/{}", adb::SAVE_DIR, entry.name);
+        let path = format!("{target_dir}/{}", entry.name);
         adb::set_mtime(target, &path, entry.mtime).map_err(|error| {
             format!(
                 "could not restore the modification time of {} on {target}: {error}{}",
@@ -276,8 +290,8 @@ pub fn copy_save(
         })?;
     }
 
-    let remote = adb::stat_remote(target, &format!("{}/{}", adb::SAVE_DIR, CORE_FILE))?
-        .ok_or_else(|| {
+    let remote =
+        adb::stat_remote(target, &format!("{target_dir}/{CORE_FILE}"))?.ok_or_else(|| {
             format!(
                 "copy finished but {CORE_FILE} is missing on {target}{}",
                 backup_note(&backup)
@@ -301,8 +315,8 @@ pub fn copy_save(
     })
 }
 
-fn pull_entry(serial: &str, name: &str, destination: &Path) -> Result<(), String> {
-    let remote = format!("{}/{}", adb::SAVE_DIR, name);
+fn pull_entry(serial: &str, save_dir: &str, name: &str, destination: &Path) -> Result<(), String> {
+    let remote = format!("{save_dir}/{name}");
     adb::pull(serial, &remote, destination)?;
     let local = destination.join(name);
     if !local.exists() {
@@ -349,19 +363,20 @@ fn collect_tree(
 }
 
 /// Remote directory that receives the file with the given relative path.
-fn remote_parent(relative: &str) -> String {
+fn remote_parent(save_dir: &str, relative: &str) -> String {
     match relative.rsplit_once('/') {
-        Some((parent, _)) => format!("{}/{}/", adb::SAVE_DIR, parent),
-        None => format!("{}/", adb::SAVE_DIR),
+        Some((parent, _)) => format!("{save_dir}/{parent}/"),
+        None => format!("{save_dir}/"),
     }
 }
 
-fn new_backup_dir(target: &str) -> Result<PathBuf, String> {
+fn new_backup_dir(target: &str, game: &Game) -> Result<PathBuf, String> {
     let root = backups_root();
     fs::create_dir_all(&root)
         .map_err(|error| format!("could not create {}: {error}", root.display()))?;
 
-    let label = sanitize_serial(target);
+    // The package is part of the name so backups of different games stay apart.
+    let label = format!("{}-{}", game.package(), sanitize_serial(target));
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let mut candidate = root.join(format!("{label}-{stamp}"));
     let mut suffix = 1;
@@ -585,10 +600,34 @@ regular file|1|1|./ok
 
     #[test]
     fn builds_remote_parent_directories() {
-        assert_eq!(remote_parent("pp.dat"), format!("{}/", adb::SAVE_DIR));
+        let dir = "/sdcard/Android/data/com.foo.bar/files/No_Backup";
+        assert_eq!(remote_parent(dir, "pp.dat"), format!("{dir}/"));
         assert_eq!(
-            remote_parent("activequests/1794034435_ActiveQuests/save_QuestsActive.rton"),
-            format!("{}/activequests/1794034435_ActiveQuests/", adb::SAVE_DIR)
+            remote_parent(
+                dir,
+                "activequests/1794034435_ActiveQuests/save_QuestsActive.rton"
+            ),
+            format!("{dir}/activequests/1794034435_ActiveQuests/")
         );
+    }
+
+    #[test]
+    fn list_command_targets_the_selected_games_save_folder() {
+        let reflourished = crate::game::resolve("reflourished", "").unwrap();
+        let base = crate::game::resolve("base_international", "").unwrap();
+        let custom = crate::game::resolve("custom", "com.foo.bar").unwrap();
+
+        assert!(
+            list_command(&reflourished)
+                .contains("'/sdcard/Android/data/com.ea.game.pvz2_rfl/files/No_Backup'")
+        );
+        assert!(
+            list_command(&base)
+                .contains("'/sdcard/Android/data/com.ea.game.pvz2_row/files/No_Backup'")
+        );
+        assert!(
+            list_command(&custom).contains("'/sdcard/Android/data/com.foo.bar/files/No_Backup'")
+        );
+        assert!(!list_command(&base).contains("pvz2_rfl"));
     }
 }

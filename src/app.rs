@@ -1,5 +1,6 @@
 use crate::adb::{self, Device};
-use crate::config::{Config, Tab};
+use crate::config::{Config, GameChoice, Tab};
+use crate::game::{self, Game};
 use crate::pairing::{self, PairEvent, PairHandle};
 use crate::qr;
 use crate::save::{self, SyncPlan};
@@ -26,13 +27,23 @@ enum Attempt {
         target: String,
         source_name: String,
         target_name: String,
+        source_game: Game,
+        target_game: Game,
     },
     AutoSync {
         left: String,
         right: String,
         left_name: String,
         right_name: String,
+        game: Game,
     },
+}
+
+/// A game found running on a device while its save was about to be overwritten.
+#[derive(Clone, Debug)]
+struct Running {
+    serial: String,
+    game: Game,
 }
 
 enum JobEvent {
@@ -45,19 +56,19 @@ enum JobResult {
     Failure(String),
     GameRunning {
         attempt: Attempt,
-        serials: Vec<String>,
+        running: Vec<Running>,
     },
 }
 
 enum WorkerFailure {
-    GameRunning(Vec<String>),
+    GameRunning(Vec<Running>),
     Failed(String),
 }
 
 #[derive(Clone)]
 struct PendingGame {
     attempt: Attempt,
-    serials: Vec<String>,
+    running: Vec<Running>,
 }
 
 struct QrState {
@@ -237,6 +248,45 @@ impl SaveSyncApp {
         }
     }
 
+    /// The game picked for a slot. Manual has one per side; Automatic has a
+    /// single choice shared by both devices, so its slot does not matter.
+    fn slot_game_choice(&self, tab: Tab, slot: Slot) -> GameChoice {
+        match (tab, slot) {
+            (Tab::Manual, Slot::Left) => self.config.manual_left_game.clone().unwrap_or_default(),
+            (Tab::Manual, Slot::Right) => self.config.manual_right_game.clone().unwrap_or_default(),
+            (Tab::Automatic, _) => self.config.auto_choice(),
+        }
+    }
+
+    fn set_slot_game_choice(&mut self, tab: Tab, slot: Slot, choice: GameChoice) {
+        match (tab, slot) {
+            (Tab::Manual, Slot::Left) => self.config.manual_left_game = Some(choice),
+            (Tab::Manual, Slot::Right) => self.config.manual_right_game = Some(choice),
+            (Tab::Automatic, _) => self.config.set_auto_choice(choice),
+        }
+        self.config.save();
+    }
+
+    fn slot_game(&self, tab: Tab, slot: Slot) -> Result<Game, String> {
+        self.slot_game_choice(tab, slot).resolve()
+    }
+
+    /// The game picked for a slot of the current tab, or `None` after showing
+    /// why it cannot be used.
+    fn game_or_report(&mut self, slot: Slot) -> Option<Game> {
+        match self.slot_game(self.tab, slot) {
+            Ok(game) => Some(game),
+            Err(error) => {
+                let message = match self.tab {
+                    Tab::Manual => format!("{} game: {error}", role_label(self.tab, slot)),
+                    Tab::Automatic => error,
+                };
+                self.status = Some((StatusKind::Error, message));
+                None
+            }
+        }
+    }
+
     fn actions_enabled(&self) -> bool {
         self.adb_error.is_none() && self.busy.is_none() && self.pending_game.is_none()
     }
@@ -249,18 +299,25 @@ impl SaveSyncApp {
         std::thread::spawn(move || worker(attempt, sender));
     }
 
-    fn start_stop_and_retry(&mut self, attempt: Attempt, serials: Vec<String>) {
+    fn start_stop_and_retry(&mut self, attempt: Attempt, running: Vec<Running>) {
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         self.busy = Some("Stopping the game...".to_string());
         self.status = None;
-        std::thread::spawn(move || stop_worker(attempt, serials, sender));
+        std::thread::spawn(move || stop_worker(attempt, running, sender));
     }
 
     fn start_transfer(&mut self, ctx: &egui::Context) {
         if !self.actions_enabled() {
             return;
         }
+
+        let Some(source_game) = self.game_or_report(Slot::Left) else {
+            return;
+        };
+        let Some(target_game) = self.game_or_report(Slot::Right) else {
+            return;
+        };
 
         let source = self.slot_serial(self.tab, Slot::Left).cloned();
         let target = self.slot_serial(self.tab, Slot::Right).cloned();
@@ -282,10 +339,13 @@ impl SaveSyncApp {
             return;
         };
 
-        if source == target {
+        // The same device is fine when the games differ, for example to move
+        // a base game save into a mod installed on that device.
+        if source == target && source_game.package() == target_game.package() {
             self.status = Some((
                 StatusKind::Error,
-                "Choose two different devices before transferring.".to_string(),
+                "Choose two different devices, or two different games, before transferring."
+                    .to_string(),
             ));
             return;
         }
@@ -299,6 +359,8 @@ impl SaveSyncApp {
             target_name: self.device_name(&target),
             source,
             target,
+            source_game,
+            target_game,
         });
     }
 
@@ -306,6 +368,10 @@ impl SaveSyncApp {
         if !self.actions_enabled() {
             return;
         }
+
+        let Some(game) = self.game_or_report(Slot::Left) else {
+            return;
+        };
 
         let left = self.slot_serial(self.tab, Slot::Left).cloned();
         let right = self.slot_serial(self.tab, Slot::Right).cloned();
@@ -344,6 +410,7 @@ impl SaveSyncApp {
             right_name: self.device_name(&right),
             left,
             right,
+            game,
         });
     }
 
@@ -428,8 +495,8 @@ impl SaveSyncApp {
                         JobResult::Failure(message) => {
                             self.status = Some((StatusKind::Error, message));
                         }
-                        JobResult::GameRunning { attempt, serials } => {
-                            self.pending_game = Some(PendingGame { attempt, serials });
+                        JobResult::GameRunning { attempt, running } => {
+                            self.pending_game = Some(PendingGame { attempt, running });
                         }
                     }
                     ctx.request_repaint();
@@ -517,6 +584,14 @@ impl SaveSyncApp {
             self.device_card(&mut columns[2], tab, Slot::Right, "Target");
         });
 
+        let different_games = match (
+            self.slot_game(tab, Slot::Left),
+            self.slot_game(tab, Slot::Right),
+        ) {
+            (Ok(source), Ok(target)) => source.package() != target.package(),
+            _ => false,
+        };
+
         ui.add_space(22.0);
         ui.vertical_centered(|ui| {
             let clicked = ui
@@ -536,6 +611,16 @@ impl SaveSyncApp {
                 )
                 .weak(),
             );
+            if different_games {
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Source and target are different games, so their saves may not be compatible.",
+                    )
+                    .small()
+                    .color(ui.visuals().warn_fg_color),
+                );
+            }
         });
     }
 
@@ -547,6 +632,9 @@ impl SaveSyncApp {
             self.device_card(&mut columns[0], tab, Slot::Left, "Device A");
             self.device_card(&mut columns[1], tab, Slot::Right, "Device B");
         });
+
+        ui.add_space(14.0);
+        self.game_picker(ui);
 
         ui.add_space(22.0);
         ui.vertical_centered(|ui| {
@@ -586,6 +674,9 @@ impl SaveSyncApp {
             .filter(|serial| !devices.iter().any(|device| &device.serial == *serial))
             .map(|serial| format!("{} is not connected", short_serial(serial)));
         let mut show_qr = false;
+        // Manual picks a game per side; Automatic has one shared picker below its cards.
+        let game_choice = (tab == Tab::Manual).then(|| self.slot_game_choice(tab, slot));
+        let mut new_game: Option<GameChoice> = None;
 
         egui::Frame::group(ui.style())
             .inner_margin(egui::Margin::same(16))
@@ -628,15 +719,60 @@ impl SaveSyncApp {
                                 .color(ui.visuals().warn_fg_color),
                         );
                     }
+
+                    if let Some(choice) = &game_choice {
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("Game").small().weak());
+                        ui.add_space(4.0);
+                        new_game = game_choice_ui(
+                            ui,
+                            ("game-picker", tab as u8, slot as u8),
+                            choice,
+                            actions_enabled,
+                            220.0,
+                        );
+                    }
                 });
             });
 
+        if let Some(choice) = new_game {
+            self.set_slot_game_choice(tab, slot, choice);
+            self.status = None;
+        }
         if selection != previous {
             self.set_slot_device(tab, slot, selection);
             self.status = None;
         }
         if show_qr {
             self.open_qr(ui.ctx(), tab, slot);
+        }
+    }
+
+    /// The Automatic tab's game picker: one choice for both devices, remembered
+    /// between runs. (Manual has a picker inside each device card instead.)
+    fn game_picker(&mut self, ui: &mut egui::Ui) {
+        let enabled = self.actions_enabled();
+        let choice = self.slot_game_choice(Tab::Automatic, Slot::Left);
+        let mut updated = None;
+
+        ui.vertical_centered(|ui| {
+            egui::Frame::group(ui.style())
+                .inner_margin(egui::Margin::same(16))
+                .show(ui, |ui| {
+                    ui.set_width(260.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("Game").strong());
+                        ui.add_space(6.0);
+                        updated = game_choice_ui(ui, "game-picker-shared", &choice, enabled, 240.0);
+                    });
+                });
+        });
+
+        if let Some(choice) = updated {
+            self.set_slot_game_choice(Tab::Automatic, Slot::Left, choice);
+            self.status = None;
         }
     }
 
@@ -691,11 +827,7 @@ impl SaveSyncApp {
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("PVZ2 Reflourished Save Sync")
-                    .size(22.0)
-                    .strong(),
-            );
+            ui.label(egui::RichText::new("PVZ2 Save Sync").size(22.0).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).weak());
             });
@@ -846,16 +978,42 @@ impl SaveSyncApp {
         }
     }
 
+    /// "<game> is running on <device>", naming each game when they differ.
+    fn describe_running(&self, running: &[Running]) -> String {
+        let Some(first) = running.first() else {
+            return String::new();
+        };
+        if running.iter().all(|item| item.game == first.game) {
+            let names: Vec<String> = running
+                .iter()
+                .map(|item| self.device_name(&item.serial))
+                .collect();
+            format!(
+                "{} is running on {}.",
+                first.game.label(),
+                names.join(" and ")
+            )
+        } else {
+            let parts: Vec<String> = running
+                .iter()
+                .map(|item| {
+                    format!(
+                        "{} is running on {}",
+                        item.game.label(),
+                        self.device_name(&item.serial)
+                    )
+                })
+                .collect();
+            format!("{}.", parts.join(" and "))
+        }
+    }
+
     fn show_game_dialog(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.pending_game.clone() else {
             return;
         };
 
-        let names: Vec<String> = pending
-            .serials
-            .iter()
-            .map(|serial| self.device_name(serial))
-            .collect();
+        let message = self.describe_running(&pending.running);
         let mut open = true;
         let mut stop = false;
         let mut cancel = false;
@@ -866,10 +1024,7 @@ impl SaveSyncApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label(format!(
-                    "Reflourished is running on {}.",
-                    names.join(" and ")
-                ));
+                ui.label(&message);
                 ui.label(
                     "Save files change while the game is running, so syncing now could corrupt progress.",
                 );
@@ -886,13 +1041,29 @@ impl SaveSyncApp {
 
         if stop {
             self.pending_game = None;
-            self.start_stop_and_retry(pending.attempt, pending.serials);
+            self.start_stop_and_retry(pending.attempt, pending.running);
         } else if cancel || !open {
             self.pending_game = None;
         }
     }
 
     fn show_about(&mut self, ctx: &egui::Context) {
+        let save_dirs: Vec<(Option<&str>, Result<String, String>)> = match self.tab {
+            Tab::Manual => [Slot::Left, Slot::Right]
+                .into_iter()
+                .map(|slot| {
+                    let dir = self
+                        .slot_game(Tab::Manual, slot)
+                        .map(|game| game.save_dir());
+                    (Some(role_label(Tab::Manual, slot)), dir)
+                })
+                .collect(),
+            Tab::Automatic => vec![(
+                None,
+                self.slot_game(Tab::Automatic, Slot::Left)
+                    .map(|game| game.save_dir()),
+            )],
+        };
         let mut open = self.about_open;
         egui::Window::new("About")
             .open(&mut open)
@@ -900,19 +1071,23 @@ impl SaveSyncApp {
             .resizable(false)
             .default_width(430.0)
             .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new("PVZ2 Reflourished Save Sync")
-                        .strong()
-                        .size(16.0),
-                );
+                ui.label(egui::RichText::new("PVZ2 Save Sync").strong().size(16.0));
                 ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                 ui.add_space(6.0);
                 ui.label(
-                    "Syncs Plants vs. Zombies 2 Reflourished saves between Waydroid and an Android phone over ADB.",
+                    "Syncs Plants vs. Zombies 2 saves (the base game, Reflourished and other mods) between Waydroid and an Android phone over ADB.",
                 );
                 ui.add_space(6.0);
-                ui.label("Save folder:");
-                ui.label(egui::RichText::new(adb::SAVE_DIR).monospace());
+                ui.label("Save folder of the selected game:");
+                for (role, dir) in &save_dirs {
+                    if let Some(role) = role {
+                        ui.label(egui::RichText::new(*role).small().weak());
+                    }
+                    match dir {
+                        Ok(dir) => ui.label(egui::RichText::new(dir).monospace()),
+                        Err(_) => ui.label(egui::RichText::new("Choose a valid game first.").weak()),
+                    };
+                }
                 ui.label(
                     "The target save is backed up locally before it is overwritten.",
                 );
@@ -961,10 +1136,10 @@ fn worker(attempt: Attempt, sender: Sender<JobEvent>) {
         Ok(message) => {
             let _ = sender.send(JobEvent::Finished(JobResult::Success(message)));
         }
-        Err(WorkerFailure::GameRunning(serials)) => {
+        Err(WorkerFailure::GameRunning(running)) => {
             let _ = sender.send(JobEvent::Finished(JobResult::GameRunning {
                 attempt,
-                serials,
+                running,
             }));
         }
         Err(WorkerFailure::Failed(message)) => {
@@ -973,10 +1148,10 @@ fn worker(attempt: Attempt, sender: Sender<JobEvent>) {
     }
 }
 
-fn stop_worker(attempt: Attempt, serials: Vec<String>, sender: Sender<JobEvent>) {
-    for serial in &serials {
+fn stop_worker(attempt: Attempt, running: Vec<Running>, sender: Sender<JobEvent>) {
+    for item in &running {
         let _ = sender.send(JobEvent::Progress("Stopping the game...".to_string()));
-        if let Err(error) = adb::force_stop(serial) {
+        if let Err(error) = adb::force_stop(&item.serial, &item.game) {
             let _ = sender.send(JobEvent::Finished(JobResult::Failure(error)));
             return;
         }
@@ -996,48 +1171,61 @@ fn run_attempt(attempt: &Attempt, sender: &Sender<JobEvent>) -> Result<String, W
             target,
             source_name,
             target_name,
+            source_game,
+            target_game,
         } => {
             let _ = sender.send(JobEvent::Progress("Checking both devices...".to_string()));
-            let source_probe = save::probe(source).map_err(WorkerFailure::Failed)?;
-            let target_probe = save::probe(target).map_err(WorkerFailure::Failed)?;
+            let source_probe = save::probe(source, source_game).map_err(WorkerFailure::Failed)?;
+            let target_probe = save::probe(target, target_game).map_err(WorkerFailure::Failed)?;
 
             check_running(&[
-                (source.as_str(), source_probe.running),
-                (target.as_str(), target_probe.running),
+                (source.as_str(), source_game, source_probe.running),
+                (target.as_str(), target_game, target_probe.running),
             ])?;
 
             if !source_probe.has_save() {
                 return Err(WorkerFailure::Failed(format!(
-                    "{source_name} has no Reflourished save yet. Start the game once on that device, then try again."
+                    "{source_name} has no {} save yet. Make sure it is installed, start the game once on that device, then try again.",
+                    source_game.label()
                 )));
             }
 
-            copy_and_describe(source, target, source_name, target_name, sender)
+            copy_and_describe(
+                source,
+                target,
+                source_name,
+                target_name,
+                source_game,
+                target_game,
+                sender,
+            )
         }
         Attempt::AutoSync {
             left,
             right,
             left_name,
             right_name,
+            game,
         } => {
             let _ = sender.send(JobEvent::Progress("Reading both saves...".to_string()));
-            let left_probe = save::probe(left).map_err(WorkerFailure::Failed)?;
-            let right_probe = save::probe(right).map_err(WorkerFailure::Failed)?;
+            let left_probe = save::probe(left, game).map_err(WorkerFailure::Failed)?;
+            let right_probe = save::probe(right, game).map_err(WorkerFailure::Failed)?;
 
             check_running(&[
-                (left.as_str(), left_probe.running),
-                (right.as_str(), right_probe.running),
+                (left.as_str(), game, left_probe.running),
+                (right.as_str(), game, right_probe.running),
             ])?;
 
             match save::plan(&left_probe, &right_probe) {
                 SyncPlan::LeftToRight => {
-                    copy_and_describe(left, right, left_name, right_name, sender)
+                    copy_and_describe(left, right, left_name, right_name, game, game, sender)
                 }
                 SyncPlan::RightToLeft => {
-                    copy_and_describe(right, left, right_name, left_name, sender)
+                    copy_and_describe(right, left, right_name, left_name, game, game, sender)
                 }
                 SyncPlan::InSync => Ok(format!(
-                    "{left_name} and {right_name} already have the same save. Nothing was copied."
+                    "{left_name} and {right_name} already have the same {} save. Nothing was copied.",
+                    game.label()
                 )),
                 SyncPlan::Ambiguous {
                     mtime,
@@ -1047,26 +1235,30 @@ fn run_attempt(attempt: &Attempt, sender: &Sender<JobEvent>) -> Result<String, W
                     "{left_name} and {right_name} have the same save time ({}) but different sizes ({left_size} and {right_size} bytes), so no save was copied.",
                     save::format_mtime(mtime)
                 ))),
-                SyncPlan::NoSave => Err(WorkerFailure::Failed(
-                    "Neither device has a Reflourished save yet. Start the game on one device first."
-                        .to_string(),
-                )),
+                SyncPlan::NoSave => Err(WorkerFailure::Failed(format!(
+                    "Neither device has a {} save yet. Make sure it is installed and start the game on one device first.",
+                    game.label()
+                ))),
             }
         }
     }
 }
 
-fn check_running(devices: &[(&str, bool)]) -> Result<(), WorkerFailure> {
-    let serials: Vec<String> = devices
+/// Fails with the games that are running; each entry is (device, its game, running).
+fn check_running(devices: &[(&str, &Game, bool)]) -> Result<(), WorkerFailure> {
+    let running: Vec<Running> = devices
         .iter()
-        .filter(|(_, running)| *running)
-        .map(|(serial, _)| (*serial).to_string())
+        .filter(|(_, _, running)| *running)
+        .map(|(serial, game, _)| Running {
+            serial: (*serial).to_string(),
+            game: (*game).clone(),
+        })
         .collect();
 
-    if serials.is_empty() {
+    if running.is_empty() {
         Ok(())
     } else {
-        Err(WorkerFailure::GameRunning(serials))
+        Err(WorkerFailure::GameRunning(running))
     }
 }
 
@@ -1075,18 +1267,31 @@ fn copy_and_describe(
     target: &str,
     source_name: &str,
     target_name: &str,
+    source_game: &Game,
+    target_game: &Game,
     sender: &Sender<JobEvent>,
 ) -> Result<String, WorkerFailure> {
     let mut progress = |message: &str| {
         let _ = sender.send(JobEvent::Progress(message.to_string()));
     };
 
-    let report = save::copy_save(source, target, &mut progress).map_err(WorkerFailure::Failed)?;
-    let mut message = format!(
-        "Copied {} save entries from {source_name} to {target_name} (save from {}).",
-        report.entries,
-        save::format_mtime(report.mtime)
-    );
+    let report = save::copy_save(source, target, source_game, target_game, &mut progress)
+        .map_err(WorkerFailure::Failed)?;
+    let saved = save::format_mtime(report.mtime);
+    let mut message = if source_game == target_game {
+        format!(
+            "Copied the {} save ({} entries) from {source_name} to {target_name} (save from {saved}).",
+            source_game.label(),
+            report.entries,
+        )
+    } else {
+        format!(
+            "Copied the {} save ({} entries) from {source_name} into {} on {target_name} (save from {saved}).",
+            source_game.label(),
+            report.entries,
+            target_game.label(),
+        )
+    };
     if let Some(backup) = &report.backup {
         message.push_str(&format!(
             " The previous {target_name} save is backed up at {}.",
@@ -1094,6 +1299,79 @@ fn copy_and_describe(
         ));
     }
     Ok(message)
+}
+
+/// Game dropdown plus, below it, the package name of a preset or the text
+/// field for a custom package. Returns the new selection when it changed.
+fn game_choice_ui(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    choice: &GameChoice,
+    enabled: bool,
+    max_width: f32,
+) -> Option<GameChoice> {
+    let mut edited = choice.clone();
+    let width = ui.available_width().min(max_width);
+
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.vertical_centered(|ui| {
+            let selected_text = match game::find_preset(&edited.id) {
+                Some(preset) => preset.label.to_string(),
+                None => "Custom package...".to_string(),
+            };
+
+            egui::ComboBox::from_id_salt(id_salt)
+                .width(width)
+                .selected_text(selected_text)
+                .show_ui(ui, |ui| {
+                    for preset in game::PRESETS {
+                        ui.selectable_value(&mut edited.id, preset.id.to_string(), preset.label)
+                            .on_hover_text(preset.package);
+                    }
+                    ui.selectable_value(
+                        &mut edited.id,
+                        game::CUSTOM_ID.to_string(),
+                        "Custom package...",
+                    );
+                });
+
+            if edited.id == game::CUSTOM_ID {
+                ui.add_space(4.0);
+                // Left-aligned, like the dropdown above it.
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut edited.custom_package)
+                            .hint_text("com.example.game")
+                            .desired_width(width),
+                    )
+                    .on_hover_text(
+                        "Package name of the game as installed on the device. \
+                         Its save must be in Android/data/<package>/files/No_Backup.",
+                    );
+                });
+                if !edited.custom_package.trim().is_empty()
+                    && let Err(message) = game::validate_package(&edited.custom_package)
+                {
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(message)
+                            .small()
+                            .color(ui.visuals().warn_fg_color),
+                    );
+                }
+            } else if let Some(preset) = game::find_preset(&edited.id) {
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(preset.package)
+                        .small()
+                        .monospace()
+                        .weak(),
+                );
+            }
+        });
+    });
+
+    (edited != *choice).then_some(edited)
 }
 
 fn role_label(tab: Tab, slot: Slot) -> &'static str {

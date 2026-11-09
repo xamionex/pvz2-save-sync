@@ -1,6 +1,7 @@
 mod adb;
 mod app;
 mod config;
+mod game;
 mod pairing;
 mod qr;
 mod save;
